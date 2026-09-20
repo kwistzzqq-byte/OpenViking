@@ -27,6 +27,7 @@ from openviking.parse.parsers.upload_utils import is_text_file
 from openviking.server.identity import RequestContext
 from openviking.service.task_work_index import TaskWorkRejected
 from openviking.storage.abstract_overview import body_for_preview, embedding_text_for_body
+from openviking.storage.acl import CreatorAclGrant
 from openviking.storage.queuefs import get_queue_manager
 from openviking.storage.queuefs.embedding_msg_converter import EmbeddingMsgConverter
 from openviking.storage.viking_fs import LS_ALL_NODES, get_viking_fs
@@ -39,7 +40,7 @@ from openviking_cli.utils import VikingURI, get_logger
 from openviking_cli.utils.config import get_openviking_config
 from openviking_cli.utils.config.embedding_config import (
     SUMMARY_TEXT_SOURCES,
-    TEXT_SOURCE_SUMMARY_ONLY,
+    TEXT_SOURCE_SUMMARY_FIRST,
 )
 
 logger = get_logger(__name__)
@@ -164,7 +165,7 @@ async def _resolve_context_timestamps(
 ) -> tuple[datetime, datetime]:
     updated_at = datetime.now(timezone.utc)
     try:
-        stat_result = await get_viking_fs().stat(uri, ctx=ctx)
+        stat_result = await get_viking_fs().stat(uri, ctx=ctx, skip_count=True)
         stat_mod_time = _coerce_datetime((stat_result or {}).get("modTime"))
         if stat_mod_time is not None:
             updated_at = stat_mod_time
@@ -362,7 +363,11 @@ async def vectorize_directory_meta(
     include_overview: bool = True,
     scalar_overrides: Optional[Dict[int, Dict[str, Any]]] = None,
     ingest_options: IngestOptions | None = None,
+    creator_acl_grant: CreatorAclGrant | None = None,
     include_abstract: bool = True,
+    meta: Optional[Dict[str, Any]] = None,
+    *,
+    content_is_body: bool = False,
 ) -> None:
     """
     Vectorize directory metadata (.abstract.md and .overview.md).
@@ -372,8 +377,11 @@ async def vectorize_directory_meta(
     # Callers may provide either freshly generated bodies or raw sidecar bytes
     # read during reindex/import. Normalize at this shared boundary so protected
     # operational metadata never leaks into vector text or rerank scalars.
-    abstract = body_for_preview(abstract)
-    overview = body_for_preview(overview)
+    # Skill producers have already extracted the bodies. Their Markdown may
+    # itself start with YAML frontmatter, which must not be parsed as OKF again.
+    if not content_is_body:
+        abstract = body_for_preview(abstract)
+        overview = body_for_preview(overview)
     first_enqueue_error: Optional[Exception] = None
     try:
         if not ctx:
@@ -407,11 +415,12 @@ async def vectorize_directory_meta(
                 user=ctx.user,
                 account_id=ctx.account_id,
                 owner_space=owner_space,
+                meta=meta,
             )
             context_abstract.set_vectorize(
                 Vectorize(text=embedding_text_for_body(ContextLevel.ABSTRACT, uri, abstract))
             )
-            msg_abstract = EmbeddingMsgConverter.from_context(context_abstract)
+            msg_abstract = EmbeddingMsgConverter.from_context(context_abstract, creator_acl_grant)
             _apply_scalar_overrides(
                 msg_abstract,
                 (scalar_overrides or {}).get(int(ContextLevel.ABSTRACT.value)),
@@ -452,11 +461,12 @@ async def vectorize_directory_meta(
                 user=ctx.user,
                 account_id=ctx.account_id,
                 owner_space=owner_space,
+                meta=meta,
             )
             context_overview.set_vectorize(
                 Vectorize(text=embedding_text_for_body(ContextLevel.OVERVIEW, uri, overview))
             )
-            msg_overview = EmbeddingMsgConverter.from_context(context_overview)
+            msg_overview = EmbeddingMsgConverter.from_context(context_overview, creator_acl_grant)
             _apply_scalar_overrides(
                 msg_overview,
                 (scalar_overrides or {}).get(int(ContextLevel.OVERVIEW.value)),
@@ -501,6 +511,7 @@ async def vectorize_file(
     preserve_existing_created_at: bool = False,
     scalar_override: Optional[Dict[str, Any]] = None,
     ingest_options: IngestOptions | None = None,
+    creator_acl_grant: CreatorAclGrant | None = None,
 ) -> bool:
     """
     Vectorize a single file.
@@ -545,7 +556,7 @@ async def vectorize_file(
         content_type = await _resolve_resource_content_type(file_path, file_name, viking_fs, ctx)
         embedding_cfg = get_openviking_config().embedding
         configured_text_source = embedding_cfg.text_source
-        effective_text_source = TEXT_SOURCE_SUMMARY_ONLY if use_summary else configured_text_source
+        effective_text_source = TEXT_SOURCE_SUMMARY_FIRST if use_summary else configured_text_source
         embed_summary = bool(summary and effective_text_source in SUMMARY_TEXT_SOURCES)
 
         if content_type in (ResourceContentType.AUDIO, ResourceContentType.VIDEO):
@@ -616,7 +627,7 @@ async def vectorize_file(
             logger.debug(f"Skipping file {file_path} (no text content or summary)")
             return False
 
-        embedding_msg = EmbeddingMsgConverter.from_context(context)
+        embedding_msg = EmbeddingMsgConverter.from_context(context, creator_acl_grant)
         if not embedding_msg:
             return False
 

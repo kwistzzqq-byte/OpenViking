@@ -40,12 +40,73 @@ class _RecordingVikingDB:
         return [{"id": "recursive-child-detail"}]
 
 
+@pytest.mark.asyncio
+async def test_resource_processor_upload_understanding_file_delegates():
+    processor = ResourceProcessor(_FakeVikingDB())
+    media_processor = SimpleNamespace(upload_understanding_file=AsyncMock(return_value="file-1"))
+    processor._media_processor = media_processor
+
+    result = await processor.upload_understanding_file("/tmp/upload.pdf")
+
+    assert result == "file-1"
+    media_processor.upload_understanding_file.assert_awaited_once_with("/tmp/upload.pdf")
+
+
 @pytest.fixture
 def ctx() -> RequestContext:
     return RequestContext(
         user=UserIdentifier("account-1", "user-1"),
         role=Role.USER,
     )
+
+
+@pytest.mark.asyncio
+async def test_github_token_prefers_account_config_over_environment(monkeypatch, ctx):
+    monkeypatch.setenv("GITHUB_TOKEN", "environment-token")
+    monkeypatch.setattr(
+        "openviking.utils.resource_processor.is_github_url",
+        lambda _source: True,
+    )
+    manager = SimpleNamespace(
+        get_account=AsyncMock(return_value=SimpleNamespace(token="account-token"))
+    )
+    processor = ResourceProcessor(
+        _FakeVikingDB(),
+        runtime_config_manager=manager,
+    )
+
+    token = await processor.github_token_for("https://github.com/org/private", ctx)
+
+    assert token == "account-token"
+    manager.get_account.assert_awaited_once_with("account-1", "github")
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "git@github.com:org/private.git",
+        "ssh://git@github.com/org/private.git",
+    ],
+)
+@pytest.mark.asyncio
+async def test_github_token_is_not_injected_into_ssh_sources(monkeypatch, ctx, source):
+    monkeypatch.setenv("GITHUB_TOKEN", "environment-token")
+    monkeypatch.setattr(
+        "openviking.utils.resource_processor.is_github_url",
+        lambda _source: True,
+    )
+    manager = SimpleNamespace(
+        get_account=AsyncMock(return_value=SimpleNamespace(token="account-token"))
+    )
+    processor = ResourceProcessor(
+        _FakeVikingDB(),
+        runtime_config_manager=manager,
+    )
+    kwargs = {"branch": "main"}
+
+    assert await processor.github_token_for(source, ctx) is None
+    assert await processor._source_config_kwargs(source, ctx, kwargs) is kwargs
+    manager.get_account.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -87,6 +148,7 @@ async def test_flat_file_refreshes_parent_semantics_and_vectorizes_via_summary(
         ctx=ctx,
         skip_vectorization=False,
         ingest_options=IngestOptions(),
+        created=True,
     )
 
 
